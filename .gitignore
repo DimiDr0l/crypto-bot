@@ -1,0 +1,11 @@
+.vscode/
+.alcache/
+.alpackages/
+.snapshots/
+.output/
+*.app
+.env
+*.log
+/venv
+__pycache__
+__init__.*
