@@ -58,8 +58,8 @@ class BitgetTradingBot:
         self.market_api = marketApi.MarketApi(api_key, secret_key, passphrase)
         
         # Настройки торговли из переменных окружения
-        # self.symbol = "BTCUSDT_UMCBL"
-        self.symbol = "ETHUSDT_UMCBL"
+        # Поддержка нескольких торговых пар (через переменную окружения SYMBOLS, по умолчанию ETH и BTC)
+        self.symbols = [s.strip() for s in os.getenv('SYMBOLS', 'ETHUSDT_UMCBL,BTCUSDT_UMCBL').split(',') if s.strip()]
         self.margin_coin = "USDT"
         self.max_position_percent = float(os.getenv('MAX_POSITION_PERCENT', '5.0'))
         self.max_risk_percent = float(os.getenv('MAX_RISK_PERCENT', '30.0'))
@@ -99,38 +99,38 @@ class BitgetTradingBot:
             logger.error(f"Ошибка при получении баланса: {e.message}")
             return 0.0
 
-    def get_current_positions(self) -> List[Dict]:
-        """Получение текущих позиций"""
+    def get_current_positions(self, symbol: Optional[str] = None) -> List[Dict]:
+        """Получение текущих позиций. При указании symbol вернёт только позиции по этому инструменту."""
         try:
             params = {"productType": "umcbl", "marginCoin": self.margin_coin}
             response = self.account_api.allPosition(params)
-            
+
             if response.get('code') == '00000':
                 positions = response.get('data', [])
                 active_positions = [pos for pos in positions if float(pos.get('total', 0)) != 0]
-                logger.info(f"Активных позиций: {len(active_positions)}")
+                if symbol:
+                    active_positions = [pos for pos in active_positions if pos.get('symbol') == symbol]
+                logger.info(f"Активных позиций: {len(active_positions)}" + (f" (фильтр: {symbol})" if symbol else ""))
                 return active_positions
-            
+
             return []
-            
+
         except BitgetAPIException as e:
             logger.error(f"Ошибка при получении позиций: {e.message}")
             return []
 
-    def get_market_data(self) -> Dict:
-        """Получение рыночных данных для анализа"""
+    def get_market_data(self, symbol: str) -> Dict:
+        """Получение рыночных данных для анализа по конкретному инструменту"""
         try:
             # Получаем текущую цену
-            ticker_params = {"symbol": self.symbol}
+            ticker_params = {"symbol": symbol}
             ticker_response = self.market_api.ticker(ticker_params)
-            
-            # Получаем исторические данные (свечи за последние 24 часа)
 
-            # Получаем текущее время в миллисекундах
+            # Получаем исторические данные (свечи за последние 24 часа)
             timestamp_current_ms = int(time.time() * 1000)
             timestamp_24h_ago = timestamp_current_ms - 86400000
             kline_params = {
-                "symbol": self.symbol,
+                "symbol": symbol,
                 "granularity": "15m",  # 15-минутные свечи
                 "startTime": timestamp_24h_ago,
                 "endTime": timestamp_current_ms,
@@ -150,24 +150,22 @@ class BitgetTradingBot:
                 market_data["current_price"] = float(ticker_data.get('last', 0))
                 market_data["volume_24h"] = float(ticker_data.get('baseVolume', 0))
                 market_data["price_change_24h"] = float(ticker_data.get('chgUtc', 0))
-            
+
             if kline_response:
                 market_data["klines"] = kline_response
-            
-            logger.info(f"Получены рыночные данные. Цена: {market_data['current_price']}")
+
+            logger.info(f"[{symbol}] Получены рыночные данные. Цена: {market_data['current_price']}")
             return market_data
-            
+
         except BitgetAPIException as e:
-            logger.error(f"Ошибка при получении рыночных данных: {e.message}")
+            logger.error(f"[{symbol}] Ошибка при получении рыночных данных: {e.message}")
             return {}
 
-    def analyze_with_ai(self, market_data: Dict) -> Dict:
+    def analyze_with_ai(self, market_data: Dict, symbol: str) -> Dict:
         """Анализ рынка с помощью локального ИИ"""
         try:
-            # Формируем промпт для ИИ
-            prompt = self._create_analysis_prompt(market_data)
-            
-            # Отправляем запрос к LM Studio
+            prompt = self._create_analysis_prompt(market_data, symbol)
+
             headers = {"Content-Type": "application/json"}
             payload = {
                 "model": LM_STUDIO_MODEL,
@@ -178,31 +176,29 @@ class BitgetTradingBot:
                 "temperature": 0.3,
                 "max_tokens": 500
             }
-            
+
             response = requests.post(
                 f"{self.lm_studio_url}/v1/chat/completions",
                 headers=headers,
                 json=payload,
                 timeout=30
             )
-            
+
             if response.status_code == 200:
                 ai_response = response.json()
                 analysis = ai_response['choices'][0]['message']['content']
-                
-                # Парсим рекомендации ИИ
                 decision = self._parse_ai_response(analysis)
-                logger.info(f"ИИ рекомендация: {decision}")
+                logger.info(f"[{symbol}] ИИ рекомендация: {decision}")
                 return decision
             else:
-                logger.error(f"Ошибка API LM Studio: {response.status_code}")
+                logger.error(f"[{symbol}] Ошибка API LM Studio: {response.status_code}")
                 return {"action": "hold", "confidence": 0}
-                
+
         except Exception as e:
-            logger.error(f"Ошибка при обращении к ИИ: {str(e)}")
+            logger.error(f"[{symbol}] Ошибка при обращении к ИИ: {str(e)}")
             return {"action": "hold", "confidence": 0}
 
-    def _create_analysis_prompt(self, market_data: Dict) -> str:
+    def _create_analysis_prompt(self, market_data: Dict, symbol: str) -> str:
         """Создание промпта для анализа ИИ"""
         klines_text = ""
         if market_data.get("klines"):
@@ -210,8 +206,8 @@ class BitgetTradingBot:
             klines_text = "Последние 20 свечей (время, открытие, максимум, минимум, закрытие, объем):\n"
             for kline in recent_klines:
                 klines_text += f"{kline[0]}, {kline[1]}, {kline[2]}, {kline[3]}, {kline[4]}, {kline[5]}\n"
-        
-        prompt = f"""Проанализируйте рыночные данные для ETHUSDT:
+
+        prompt = f"""Проанализируйте рыночные данные для {symbol}:
 
 Текущая цена: {market_data.get('current_price', 0)}
 Изменение за 24ч: {market_data.get('price_change_24h', 0)}%
@@ -260,81 +256,65 @@ REASON: [краткое обоснование]
         
         return decision
 
-    def calculate_position_size(self, balance: float, current_price: float) -> float:
+    def calculate_position_size(self, balance: float, current_price: float, symbol: str) -> float:
         """Расчет размера позиции с учетом риск-менеджмента"""
-        # Максимальная сумма для позиции (% от баланса)
         max_position_value = balance * (self.max_position_percent / 100)
-        
-        # Дополнительное ограничение по абсолютной сумме
         max_position_value = min(max_position_value, self.max_position_value)
-        
-        # Размер позиции в BTC
+
         position_size = max_position_value / current_price
-        
-        # Округляем до допустимого количества знаков (минимальный лот на Bitget обычно 0.001)
         position_size = float(Decimal(str(position_size)).quantize(Decimal('0.001'), rounding=ROUND_DOWN))
-        
-        # Дополнительная проверка минимального размера
+
         min_position_size = 10.0 / current_price  # Минимум $10
         if position_size < min_position_size:
-            logger.warning(f"Размер позиции слишком мал: {position_size}, минимум: {min_position_size}")
+            logger.warning(f"[{symbol}] Размер позиции слишком мал: {position_size}, минимум: {min_position_size}")
             return 0.0
-        
-        logger.info(f"Расчетный размер позиции: {position_size} BTC (${max_position_value:.2f})")
+
+        logger.info(f"[{symbol}] Расчётный размер позиции: {position_size} ({max_position_value:.2f} USD)")
         return position_size
 
-    def place_order_with_stops(self, side: str, size: float, current_price: float) -> bool:
-        """Размещение ордера с автоматическими стопами"""
+    def place_order_with_stops(self, side: str, size: float, current_price: float, symbol: str) -> bool:
+        """Размещение ордера с автоматическими стопами по конкретному инструменту"""
         try:
-            # Параметры основного ордера
             order_params = {
-                "symbol": self.symbol,
+                "symbol": symbol,
                 "marginCoin": self.margin_coin,
                 "side": f"open_{side}",
                 "orderType": "market",
                 "size": str(size),
                 "timeInForceValue": "normal"
             }
-            
-            # Размещаем основной ордер
+
             response = self.order_api.placeOrder(order_params)
-            
+
             if response.get('code') != '00000':
-                logger.error(f"Ошибка размещения ордера: {response}")
+                logger.error(f"[{symbol}] Ошибка размещения ордера: {response}")
                 return False
-            
+
             order_id = response['data']['orderId']
-            logger.info(f"Ордер размещен: {order_id}, сторона: {side}, размер: {size}")
-            
-            # Ждем исполнения ордера
+            logger.info(f"[{symbol}] Ордер размещен: {order_id}, сторона: {side}, размер: {size}")
+
             time.sleep(2)
-            
-            # Устанавливаем стоп-лосс и тейк-профит
-            self._set_stop_orders(side, size, current_price)
-            
+            self._set_stop_orders(side, size, current_price, symbol)
             return True
-            
+
         except BitgetAPIException as e:
-            logger.error(f"Ошибка при размещении ордера: {e.message}")
+            logger.error(f"[{symbol}] Ошибка при размещении ордера: {e.message}")
             return False
 
-    def _set_stop_orders(self, side: str, size: float, entry_price: float):
+    def _set_stop_orders(self, side: str, size: float, entry_price: float, symbol: str):
         """Установка стоп-лосс и тейк-профит ордеров"""
         try:
             if side == "long":
-                # Для лонг позиции
                 stop_price = entry_price * (1 - self.stop_loss_percent / 100)
                 take_profit_price = entry_price * (1 + self.take_profit_percent / 100)
                 stop_side = "close_long"
             else:
-                # Для шорт позиции
                 stop_price = entry_price * (1 + self.stop_loss_percent / 100)
                 take_profit_price = entry_price * (1 - self.take_profit_percent / 100)
                 stop_side = "close_short"
-            
-            # Стоп-лосс ордер
+
             stop_loss_params = {
-                "symbol": self.symbol,
+                "symbol": symbol,
                 "marginCoin": self.margin_coin,
                 "side": stop_side,
                 "orderType": "stop_market",
@@ -342,124 +322,118 @@ REASON: [краткое обоснование]
                 "triggerPrice": str(round(stop_price, 2)),
                 "timeInForceValue": "normal"
             }
-            
-            # Тейк-профит ордер
+
             take_profit_params = {
-                "symbol": self.symbol,
+                "symbol": symbol,
                 "marginCoin": self.margin_coin,
                 "side": stop_side,
-                "orderType": "take_profit_market", 
+                "orderType": "take_profit_market",
                 "size": str(size),
                 "triggerPrice": str(round(take_profit_price, 2)),
                 "timeInForceValue": "normal"
             }
-            
-            # Размещаем стоп-ордера
+
             stop_response = self.order_api.placeOrder(stop_loss_params)
             profit_response = self.order_api.placeOrder(take_profit_params)
-            
-            if stop_response.get('code') == '00000':
-                logger.info(f"Стоп-лосс установлен: {stop_price}")
-            
-            if profit_response.get('code') == '00000':
-                logger.info(f"Тейк-профит установлен: {take_profit_price}")
-                
-        except BitgetAPIException as e:
-            logger.error(f"Ошибка при установке стоп-ордеров: {e.message}")
 
-    def close_existing_positions(self):
-        """Закрытие существующих позиций при смене направления"""
-        positions = self.get_current_positions()
-        
+            if stop_response.get('code') == '00000':
+                logger.info(f"[{symbol}] Стоп-лосс установлен: {stop_price}")
+
+            if profit_response.get('code') == '00000':
+                logger.info(f"[{symbol}] Тейк-профит установлен: {take_profit_price}")
+
+        except BitgetAPIException as e:
+            logger.error(f"[{symbol}] Ошибка при установке стоп-ордеров: {e.message}")
+
+    def close_existing_positions(self, symbol: str):
+        """Закрытие существующих позиций по конкретному инструменту при смене направления"""
+        positions = self.get_current_positions(symbol)
+
         for position in positions:
-            if position['symbol'] == self.symbol:
-                size = abs(float(position['total']))
+            if position.get('symbol') == symbol:
+                size = abs(float(position.get('total', 0)))
                 if size > 0:
-                    side = "close_long" if float(position['total']) > 0 else "close_short"
-                    
+                    side = "close_long" if float(position.get('total', 0)) > 0 else "close_short"
+
                     close_params = {
-                        "symbol": self.symbol,
+                        "symbol": symbol,
                         "marginCoin": self.margin_coin,
                         "side": side,
                         "orderType": "market",
                         "size": str(size),
                         "timeInForceValue": "normal"
                     }
-                    
+
                     try:
                         response = self.order_api.placeOrder(close_params)
                         if response.get('code') == '00000':
-                            logger.info(f"Позиция закрыта: {side}, размер: {size}")
+                            logger.info(f"[{symbol}] Позиция закрыта: {side}, размер: {size}")
                     except BitgetAPIException as e:
-                        logger.error(f"Ошибка закрытия позиции: {e.message}")
+                        logger.error(f"[{symbol}] Ошибка закрытия позиции: {e.message}")
 
     def trading_cycle(self):
-        """Основной цикл торговли"""
+        """Основной цикл торговли по всем указанным инструментам"""
         try:
             logger.info("=== Начало торгового цикла ===")
-            
-            # Получаем данные
+
             balance = self.get_account_balance()
             if balance < self.min_balance:
                 logger.warning(f"Недостаточно средств для торговли: ${balance:.2f} < ${self.min_balance}")
                 return
-            
-            positions = self.get_current_positions()
-            market_data = self.get_market_data()
-            
-            if not market_data or not market_data.get('current_price'):
-                logger.error("Не удалось получить рыночные данные")
-                return
-            
-            current_price = market_data['current_price']
-            
-            # Получаем рекомендацию от ИИ
-            ai_decision = self.analyze_with_ai(market_data)
-            
-            if ai_decision['confidence'] < self.confidence_threshold:
-                logger.info(f"ИИ не уверен в рекомендации: {ai_decision['confidence']}/{self.confidence_threshold}, пропускаем торговлю")
-                return
-            
-            # Проверяем текущие позиции
-            has_long_position = any(float(pos['total']) > 0 for pos in positions if pos['symbol'] == self.symbol)
-            has_short_position = any(float(pos['total']) < 0 for pos in positions if pos['symbol'] == self.symbol)
-            
-            action = ai_decision['action']
-            
-            if action == "buy" and not has_long_position:
-                if has_short_position:
-                    logger.info("Закрываем шорт позицию перед открытием лонг")
-                    self.close_existing_positions()
-                    time.sleep(2)
-                
-                # Открываем лонг позицию
-                position_size = self.calculate_position_size(balance, current_price)
-                if position_size > 0:
-                    success = self.place_order_with_stops("long", position_size, current_price)
-                    if success:
-                        logger.info(f"Лонг позиция открыта: {position_size} BTC по цене ${current_price}")
-            
-            elif action == "sell" and not has_short_position:
-                if has_long_position:
-                    logger.info("Закрываем лонг позицию перед открытием шорт")
-                    self.close_existing_positions()
-                    time.sleep(2)
-                
-                # Открываем шорт позицию
-                position_size = self.calculate_position_size(balance, current_price)
-                if position_size > 0:
-                    success = self.place_order_with_stops("short", position_size, current_price)
-                    if success:
-                        logger.info(f"Шорт позиция открыта: {position_size} BTC по цене ${current_price}")
-            
-            elif action == "hold":
-                logger.info("ИИ рекомендует удерживать текущие позиции")
-            
-            else:
-                logger.info(f"ИИ рекомендует {action}, но соответствующая позиция уже открыта")
-            
+
+            # Кэшируем все позиции один раз
+            all_positions = self.get_current_positions()
+
+            for symbol in self.symbols:
+                logger.info(f"--- Обработка {symbol} ---")
+                market_data = self.get_market_data(symbol)
+                if not market_data or not market_data.get('current_price'):
+                    logger.error(f"[{symbol}] Не удалось получить рыночные данные")
+                    continue
+
+                current_price = market_data['current_price']
+                ai_decision = self.analyze_with_ai(market_data, symbol)
+
+                if ai_decision['confidence'] < self.confidence_threshold:
+                    logger.info(f"[{symbol}] ИИ не уверен: {ai_decision['confidence']}/{self.confidence_threshold}, пропускаем")
+                    continue
+
+                has_long_position = any(float(pos['total']) > 0 for pos in all_positions if pos.get('symbol') == symbol)
+                has_short_position = any(float(pos['total']) < 0 for pos in all_positions if pos.get('symbol') == symbol)
+
+                action = ai_decision['action']
+
+                if action == "buy" and not has_long_position:
+                    if has_short_position:
+                        logger.info(f"[{symbol}] Закрываем шорт перед открытием лонг")
+                        self.close_existing_positions(symbol)
+                        time.sleep(2)
+
+                    position_size = self.calculate_position_size(balance, current_price, symbol)
+                    if position_size > 0:
+                        success = self.place_order_with_stops("long", position_size, current_price, symbol)
+                        if success:
+                            logger.info(f"[{symbol}] Лонг открыт: {position_size} по цене ${current_price}")
+
+                elif action == "sell" and not has_short_position:
+                    if has_long_position:
+                        logger.info(f"[{symbol}] Закрываем лонг перед открытием шорт")
+                        self.close_existing_positions(symbol)
+                        time.sleep(2)
+
+                    position_size = self.calculate_position_size(balance, current_price, symbol)
+                    if position_size > 0:
+                        success = self.place_order_with_stops("short", position_size, current_price, symbol)
+                        if success:
+                            logger.info(f"[{symbol}] Шорт открыт: {position_size} по цене ${current_price}")
+
+                elif action == "hold":
+                    logger.info(f"[{symbol}] ИИ рекомендует удерживать текущие позиции")
+                else:
+                    logger.info(f"[{symbol}] ИИ рекомендует {action}, но соответствующая позиция уже открыта")
+
             logger.info("=== Цикл торговли завершен ===")
-            
+
         except Exception as e:
             logger.error(f"Ошибка в торговом цикле: {str(e)}")
 
