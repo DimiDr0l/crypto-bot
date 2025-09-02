@@ -9,7 +9,7 @@ import requests
 import schedule
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения
@@ -58,10 +58,9 @@ class BitgetTradingBot:
         self.market_api = marketApi.MarketApi(api_key, secret_key, passphrase)
         
         # Настройки торговли из переменных окружения
-        # Поддержка нескольких торговых пар (через переменную окружения SYMBOLS, по умолчанию ETH и BTC)
         self.symbols = [s.strip() for s in os.getenv('SYMBOLS', 'ETHUSDT_UMCBL,BTCUSDT_UMCBL').split(',') if s.strip()]
         self.margin_coin = "USDT"
-        self.max_position_percent = float(os.getenv('MAX_POSITION_PERCENT', '5.0'))
+        self.max_position_percent = float(os.getenv('MAX_POSITION_PERCENT', '10.0'))  # Увеличили до 10%
         self.max_risk_percent = float(os.getenv('MAX_RISK_PERCENT', '30.0'))
         self.stop_loss_percent = float(os.getenv('STOP_LOSS_PERCENT', '2.0'))
         self.take_profit_percent = float(os.getenv('TAKE_PROFIT_PERCENT', '6.0'))
@@ -69,8 +68,13 @@ class BitgetTradingBot:
         self.check_interval = int(os.getenv('CHECK_INTERVAL', '15'))
         
         # Дополнительные настройки безопасности
-        self.min_balance = float(os.getenv('MIN_BALANCE', '10.0'))  # Минимальный баланс для торговли
-        self.max_position_value = float(os.getenv('MAX_POSITION_VALUE', '1000.0'))  # Максимальная сумма позиции
+        self.min_balance = float(os.getenv('MIN_BALANCE', '10.0'))
+        self.max_position_value = float(os.getenv('MAX_POSITION_VALUE', '1000.0'))
+        
+        # Кэш для параметров контрактов
+        self.contract_info_cache = {}
+        self.cache_update_time = {}
+        self.cache_ttl = 3600  # 1 час
         
         logger.info(f"Торговый бот инициализирован с настройками:")
         logger.info(f"- Максимальный размер позиции: {self.max_position_percent}%")
@@ -78,6 +82,55 @@ class BitgetTradingBot:
         logger.info(f"- Тейк-профит: {self.take_profit_percent}%")
         logger.info(f"- Порог уверенности ИИ: {self.confidence_threshold}/10")
         logger.info(f"- Интервал проверки: {self.check_interval} минут")
+
+    def get_contract_info(self, symbol: str) -> Dict:
+        """Получение информации о контракте из API с кэшированием"""
+        current_time = time.time()
+        
+        # Проверяем кэш
+        if (symbol in self.contract_info_cache and 
+            symbol in self.cache_update_time and 
+            current_time - self.cache_update_time[symbol] < self.cache_ttl):
+            return self.contract_info_cache[symbol]
+        
+        try:
+            params = {"productType": "umcbl"}
+            response = self.market_api.contracts(params)
+            
+            if response.get('code') == '00000' and response.get('data'):
+                for contract in response['data']:
+                    if contract.get('symbol') == symbol:
+                        # Получаем минимальную сумму торговли или используем дефолт
+                        min_trade_usdt = contract.get('minTradeUSDT')
+                        if min_trade_usdt is None or min_trade_usdt == 0:
+                            # Используем минимум по умолчанию, характерный для Bitget
+                            min_trade_usdt = 5.0
+                        
+                        contract_info = {
+                            'symbol': contract.get('symbol'),
+                            'minTradeNum': float(contract.get('minTradeNum', 0.001)),
+                            'priceEndStep': int(contract.get('priceEndStep', 2)),
+                            'volumePlace': int(contract.get('volumePlace', 3)),
+                            'sizeMultiplier': float(contract.get('sizeMultiplier', 1)),
+                            'minTradeUSDT': float(min_trade_usdt),
+                            'quoteCoin': contract.get('quoteCoin', 'USDT'),
+                            'baseCoin': contract.get('baseCoin', symbol.replace('USDT_UMCBL', ''))
+                        }
+                        
+                        # Сохраняем в кэш
+                        self.contract_info_cache[symbol] = contract_info
+                        self.cache_update_time[symbol] = current_time
+                        
+                        logger.info(f"[{symbol}] Параметры контракта: минТорги={contract_info['minTradeNum']}, "
+                                  f"минUSDT={contract_info['minTradeUSDT']}, точность={contract_info['volumePlace']}")
+                        return contract_info
+            
+            logger.error(f"[{symbol}] Не найден контракт в ответе API")
+            return {}
+            
+        except BitgetAPIException as e:
+            logger.error(f"[{symbol}] Ошибка при получении информации о контракте: {e.message}")
+            return {}
 
     def get_account_balance(self) -> float:
         """Получение баланса аккаунта в USDT"""
@@ -257,19 +310,73 @@ REASON: [краткое обоснование]
         return decision
 
     def calculate_position_size(self, balance: float, current_price: float, symbol: str) -> float:
-        """Расчет размера позиции с учетом риск-менеджмента"""
+        """Расчет размера позиции с учетом реальных ограничений биржи"""
+        
+        # Получаем информацию о контракте
+        contract_info = self.get_contract_info(symbol)
+        if not contract_info:
+            logger.error(f"[{symbol}] Не удалось получить информацию о контракте")
+            return 0.0
+        
+        # Параметры контракта
+        min_trade_num = contract_info.get('minTradeNum', 0.001)
+        min_trade_usdt_from_api = contract_info.get('minTradeUSDT', 5.0)
+        volume_place = contract_info.get('volumePlace', 3)
+        
+        # Расчитываем минимальную стоимость в USD на основе minTradeNum и текущей цены
+        min_trade_usdt_calculated = min_trade_num * current_price
+        
+        # Используем максимальное из двух значений для безопасности
+        min_trade_usdt = max(min_trade_usdt_from_api, min_trade_usdt_calculated, 5.0)
+        
+        logger.info(f"[{symbol}] Минимальные требования: "
+                   f"размер={min_trade_num}, "
+                   f"USDT_API={min_trade_usdt_from_api}, "
+                   f"USDT_calc={min_trade_usdt_calculated:.2f}, "
+                   f"итого_мин=${min_trade_usdt:.2f}")
+        
+        # Расчет максимального размера позиции в USD
         max_position_value = balance * (self.max_position_percent / 100)
         max_position_value = min(max_position_value, self.max_position_value)
-
+        
+        # Проверяем, что у нас достаточно средств для минимальной торговли
+        if max_position_value < min_trade_usdt:
+            logger.warning(f"[{symbol}] Недостаточно средств: {max_position_value:.2f} < {min_trade_usdt:.2f}")
+            # Попробуем с меньшими требованиями
+            if max_position_value >= min_trade_usdt_calculated and min_trade_usdt_calculated >= 1.0:
+                logger.info(f"[{symbol}] Используем расчетный минимум: {min_trade_usdt_calculated:.2f}")
+                min_trade_usdt = min_trade_usdt_calculated
+            else:
+                return 0.0
+        
+        # Расчет размера позиции в базовой валюте
         position_size = max_position_value / current_price
-        position_size = float(Decimal(str(position_size)).quantize(Decimal('0.001'), rounding=ROUND_DOWN))
-
-        min_position_size = 10.0 / current_price  # Минимум $10
-        if position_size < min_position_size:
-            logger.warning(f"[{symbol}] Размер позиции слишком мал: {position_size}, минимум: {min_position_size}")
+        
+        # Округляем до правильной точности согласно volumePlace
+        decimal_places = f"0.{'0' * volume_place}"
+        position_size = float(Decimal(str(position_size)).quantize(Decimal(decimal_places), rounding=ROUND_DOWN))
+        
+        # Проверяем минимальный размер торговли
+        if position_size < min_trade_num:
+            logger.warning(f"[{symbol}] Размер позиции {position_size} меньше минимального {min_trade_num}")
+            # Попробуем использовать минимально допустимый размер
+            position_size = min_trade_num
+            position_size = float(Decimal(str(position_size)).quantize(Decimal(decimal_places), rounding=ROUND_UP))
+        
+        # Финальная проверка стоимости в USD
+        final_position_value_usdt = position_size * current_price
+        if final_position_value_usdt < min_trade_usdt:
+            logger.warning(f"[{symbol}] Итоговая стоимость позиции {final_position_value_usdt:.2f} меньше минимальной {min_trade_usdt:.2f}")
             return 0.0
-
-        logger.info(f"[{symbol}] Расчётный размер позиции: {position_size} ({max_position_value:.2f} USD)")
+        
+        # Проверяем, не превышаем ли баланс
+        if final_position_value_usdt > balance * 0.95:  # Оставляем 5% на комиссии
+            logger.warning(f"[{symbol}] Позиция слишком большая относительно баланса")
+            return 0.0
+        
+        logger.info(f"[{symbol}] ✅ Финальный размер позиции: {position_size} ({final_position_value_usdt:.2f} USD)")
+        logger.info(f"[{symbol}] Параметры: минРазмер={min_trade_num}, минUSDT={min_trade_usdt:.2f}, точность={volume_place}")
+        
         return position_size
 
     def place_order_with_stops(self, side: str, size: float, current_price: float, symbol: str) -> bool:
@@ -313,13 +420,17 @@ REASON: [краткое обоснование]
                 take_profit_price = entry_price * (1 - self.take_profit_percent / 100)
                 stop_side = "close_short"
 
+            # Получаем точность цены для правильного округления
+            contract_info = self.get_contract_info(symbol)
+            price_precision = contract_info.get('priceEndStep', 2) if contract_info else 2
+
             stop_loss_params = {
                 "symbol": symbol,
                 "marginCoin": self.margin_coin,
                 "side": stop_side,
                 "orderType": "stop_market",
                 "size": str(size),
-                "triggerPrice": str(round(stop_price, 2)),
+                "triggerPrice": str(round(stop_price, price_precision)),
                 "timeInForceValue": "normal"
             }
 
@@ -329,7 +440,7 @@ REASON: [краткое обоснование]
                 "side": stop_side,
                 "orderType": "take_profit_market",
                 "size": str(size),
-                "triggerPrice": str(round(take_profit_price, 2)),
+                "triggerPrice": str(round(take_profit_price, price_precision)),
                 "timeInForceValue": "normal"
             }
 
@@ -337,10 +448,10 @@ REASON: [краткое обоснование]
             profit_response = self.order_api.placeOrder(take_profit_params)
 
             if stop_response.get('code') == '00000':
-                logger.info(f"[{symbol}] Стоп-лосс установлен: {stop_price}")
+                logger.info(f"[{symbol}] Стоп-лосс установлен: {round(stop_price, price_precision)}")
 
             if profit_response.get('code') == '00000':
-                logger.info(f"[{symbol}] Тейк-профит установлен: {take_profit_price}")
+                logger.info(f"[{symbol}] Тейк-профит установлен: {round(take_profit_price, price_precision)}")
 
         except BitgetAPIException as e:
             logger.error(f"[{symbol}] Ошибка при установке стоп-ордеров: {e.message}")
@@ -464,6 +575,26 @@ REASON: [краткое обоснование]
         except Exception as e:
             logger.error(f"❌ Ошибка подключения к Bitget: {str(e)}")
             return
+        
+        # Предзагружаем информацию о контрактах
+        logger.info("Загружаем информацию о контрактах...")
+        for symbol in self.symbols:
+            contract_info = self.get_contract_info(symbol)
+            if contract_info:
+                logger.info(f"✅ {symbol}: минРазмер={contract_info['minTradeNum']}, "
+                          f"минUSDT={contract_info['minTradeUSDT']}, точность={contract_info['volumePlace']}")
+                
+                # Получаем текущую цену для демонстрации минимальных требований
+                try:
+                    market_data = self.get_market_data(symbol)
+                    if market_data.get('current_price'):
+                        current_price = market_data['current_price']
+                        min_value_calc = contract_info['minTradeNum'] * current_price
+                        logger.info(f"   Текущая цена: ${current_price}, минимум в USD: ${min_value_calc:.2f}")
+                except:
+                    pass
+            else:
+                logger.warning(f"⚠️ {symbol}: не удалось получить информацию о контракте")
         
         # Настройка расписания с настраиваемым интервалом
         schedule.every(self.check_interval).minutes.do(self.trading_cycle)
