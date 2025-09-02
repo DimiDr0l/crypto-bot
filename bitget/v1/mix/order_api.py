@@ -57,3 +57,6 @@ class OrderApi(Client):
 
     def followerQueryHistoryOrders(self, params):
         return self._request_with_params(GET, '/api/mix/v1/trace/followerHistoryOrders', params)
+
+    def closeAllPositions(self, params):
+        return self._request_with_params(GET, '/api/mix/v1/order/close-all-positions', params)

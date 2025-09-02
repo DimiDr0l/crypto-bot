@@ -29,7 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        # logging.FileHandler('trading_bot.log'),
+        logging.FileHandler('trading_bot.log'),
         logging.StreamHandler()
     ]
 )
@@ -459,28 +459,111 @@ REASON: [краткое обоснование]
     def close_existing_positions(self, symbol: str):
         """Закрытие существующих позиций по конкретному инструменту при смене направления"""
         positions = self.get_current_positions(symbol)
-
+    
         for position in positions:
             if position.get('symbol') == symbol:
-                size = abs(float(position.get('total', 0)))
-                if size > 0:
-                    side = "close_long" if float(position.get('total', 0)) > 0 else "close_short"
-
+                total_size = float(position.get('total', 0))
+                if abs(total_size) > 0:
+                    # Определяем сторону позиции
+                    if total_size > 0:
+                        # Лонг позиция - закрываем через sell
+                        side = "close_long"
+                    else:
+                        # Шорт позиция - закрываем через buy  
+                        side = "close_short"
+                        total_size = abs(total_size)  # Делаем размер положительным
+    
+                    # Используем market ордер для быстрого закрытия позиции
                     close_params = {
                         "symbol": symbol,
                         "marginCoin": self.margin_coin,
                         "side": side,
                         "orderType": "market",
-                        "size": str(size),
+                        "size": str(total_size),
+                        "reduceOnly": "YES",  # Важно! Указываем что это закрытие позиции
                         "timeInForceValue": "normal"
                     }
-
+    
                     try:
+                        logger.info(f"[{symbol}] Закрываем {side} позицию размером {total_size}")
                         response = self.order_api.placeOrder(close_params)
+                        
                         if response.get('code') == '00000':
-                            logger.info(f"[{symbol}] Позиция закрыта: {side}, размер: {size}")
+                            order_id = response.get('data', {}).get('orderId', 'unknown')
+                            logger.info(f"[{symbol}] Позиция успешно закрыта. Order ID: {order_id}")
+                            
+                            # Дополнительно отменяем все открытые стоп-ордера для этого символа
+                            self._cancel_pending_orders(symbol)
+                            
+                        else:
+                            logger.error(f"[{symbol}] Ошибка закрытия позиции: {response}")
+                            
                     except BitgetAPIException as e:
-                        logger.error(f"[{symbol}] Ошибка закрытия позиции: {e.message}")
+                        logger.error(f"[{symbol}] API ошибка при закрытии позиции: {e.message}")
+                    except Exception as e:
+                        logger.error(f"[{symbol}] Неожиданная ошибка при закрытии позиции: {str(e)}")
+    
+        # Небольшая пауза для обработки ордеров
+        time.sleep(1)
+    
+    def _cancel_pending_orders(self, symbol: str):
+        """Отмена всех открытых ордеров по символу (стоп-лоссы, тейк-профиты)"""
+        try:
+            # Получаем все открытые ордера
+            params = {
+                "symbol": symbol,
+                "productType": "umcbl"
+            }
+            
+            response = self.order_api.ordersPending(params)
+            
+            if response.get('code') == '00000' and response.get('data'):
+                orders = response['data']
+                
+                for order in orders:
+                    order_id = order.get('orderId')
+                    if order_id:
+                        cancel_params = {
+                            "symbol": symbol,
+                            "marginCoin": self.margin_coin,
+                            "orderId": order_id
+                        }
+                        
+                        try:
+                            cancel_response = self.order_api.cancelOrder(cancel_params)
+                            if cancel_response.get('code') == '00000':
+                                logger.info(f"[{symbol}] Отменен ордер: {order_id}")
+                            else:
+                                logger.warning(f"[{symbol}] Не удалось отменить ордер {order_id}: {cancel_response}")
+                        except Exception as e:
+                            logger.warning(f"[{symbol}] Ошибка при отмене ордера {order_id}: {str(e)}")
+                            
+        except Exception as e:
+            logger.warning(f"[{symbol}] Ошибка при получении/отмене открытых ордеров: {str(e)}")
+    
+    def close_all_positions_for_symbol(self, symbol: str):
+        """Альтернативный метод для полного закрытия всех позиций по символу"""
+        try:
+            # Сначала отменяем все открытые ордера
+            self._cancel_pending_orders(symbol)
+            time.sleep(0.5)
+            
+            # Затем закрываем позиции
+            self.close_existing_positions(symbol)
+            
+            # Проверяем что позиции действительно закрыты
+            time.sleep(1)
+            remaining_positions = self.get_current_positions(symbol)
+            
+            if remaining_positions:
+                logger.warning(f"[{symbol}] Остались незакрытые позиции: {len(remaining_positions)}")
+                for pos in remaining_positions:
+                    logger.warning(f"[{symbol}] Позиция: {pos.get('total', 0)}")
+            else:
+                logger.info(f"[{symbol}] Все позиции успешно закрыты")
+                
+        except Exception as e:
+            logger.error(f"[{symbol}] Ошибка при полном закрытии позиций: {str(e)}")
 
     def trading_cycle(self):
         """Основной цикл торговли по всем указанным инструментам"""
@@ -517,7 +600,7 @@ REASON: [краткое обоснование]
                 if action == "buy" and not has_long_position:
                     if has_short_position:
                         logger.info(f"[{symbol}] Закрываем шорт перед открытием лонг")
-                        self.close_existing_positions(symbol)
+                        self.close_all_positions_for_symbol(symbol)
                         time.sleep(2)
 
                     position_size = self.calculate_position_size(balance, current_price, symbol)
@@ -529,7 +612,7 @@ REASON: [краткое обоснование]
                 elif action == "sell" and not has_short_position:
                     if has_long_position:
                         logger.info(f"[{symbol}] Закрываем лонг перед открытием шорт")
-                        self.close_existing_positions(symbol)
+                        self.close_all_positions_for_symbol(symbol)
                         time.sleep(2)
 
                     position_size = self.calculate_position_size(balance, current_price, symbol)
