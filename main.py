@@ -428,24 +428,24 @@ REASON: [краткое обоснование]
                 "symbol": symbol,
                 "marginCoin": self.margin_coin,
                 "side": stop_side,
-                "orderType": "stop_market",
+                "orderType": "market",
+                "triggerType": "market_price",
                 "size": str(size),
                 "triggerPrice": str(round(stop_price, price_precision)),
-                "timeInForceValue": "normal"
             }
 
             take_profit_params = {
                 "symbol": symbol,
                 "marginCoin": self.margin_coin,
                 "side": stop_side,
-                "orderType": "take_profit_market",
+                "orderType": "market",
+                "triggerType": "market_price",
                 "size": str(size),
                 "triggerPrice": str(round(take_profit_price, price_precision)),
-                "timeInForceValue": "normal"
             }
 
-            stop_response = self.order_api.placeOrder(stop_loss_params)
-            profit_response = self.order_api.placeOrder(take_profit_params)
+            stop_response = self.order_api.placePlanOrder(stop_loss_params)
+            profit_response = self.order_api.placePlanOrder(take_profit_params)
 
             if stop_response.get('code') == '00000':
                 logger.info(f"[{symbol}] Стоп-лосс установлен: {round(stop_price, price_precision)}")
